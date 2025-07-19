@@ -27,7 +27,7 @@ exports.generateResponse = async (business, conversationHistory, userInput) => {
     
     // Call OpenAI API - simplified without functions for now
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4o',
       messages: messages,
       temperature: 0.7,
       max_tokens: 150

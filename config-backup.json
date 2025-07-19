@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "date": "2024-01-15",
+  "services": {
+    "twilio": {
+      "accountType": "trial",
+      "phoneNumber": "+18773495663"
+    },
+    "openai": {
+      "model": "gpt-4o-mini"
+    },
+    "airtable": {
+      "bases": {
+        "businesses": "appJWneTIYp1hitAC"
+      }
+    }
+  }
+}

@@ -38,6 +38,11 @@ app.post('/webhook/conversation', voiceWebhook.handleConversation);
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
 });
+// Allow GET so Twilio's Console can validate the webhook
+app.get('/webhook/voice', (req, res) => {
+  // You can return a minimal valid TwiML or just 200 OK
+  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {

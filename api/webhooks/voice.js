@@ -1,70 +1,75 @@
-// api/webhooks/voice.js - Handles incoming phone calls from Twilio
+// api/webhooks/voice.js - Optimized for speed with minimal Airtable calls
 
 const twilio = require('twilio');
-const aiService = require('../services/aiService');
+const aiService = require('../services/groqAiService');
 const airtableService = require('../services/airtableService');
+
+// In-memory conversation storage for active calls
+const activeConversations = new Map();
 
 // This handles the initial incoming call
 exports.handleIncomingCall = async (req, res) => {
   console.log('📞 Incoming call from:', req.body.From);
   
   try {
-    // Create TwiML response (Twilio's XML format)
     const twiml = new twilio.twiml.VoiceResponse();
     
-    // Get business info based on the forwarding number that was called
+    // Get business info (only Airtable call at start)
     const business = await airtableService.getBusinessByForwardingNumber(req.body.To);
     
     if (!business) {
-      // If we can't find the business, play error message
       twiml.say({
-        voice: 'alice',
+        voice: 'Polly.Joanna',
         language: 'en-US'
       }, 'Sorry, I cannot find the business information. Please try again later.');
       
       return res.type('text/xml').send(twiml.toString());
     }
     
-    // Store call info in session
-  const gather = twiml.gather({
-  input: 'speech',
-  timeout: 10,  // Increase from 3-5 to 10 seconds (time to wait for any speech)
-  speechTimeout: 3,  // Change from 'auto' to 3 seconds (silence after speaking)
-  action: `/webhook/conversation?business_id=${business.id}`,
-  method: 'POST',
-  actionOnEmptyResult: true
-});
-    
-    // Greet the caller
-    gather.say({
-      voice: 'alice',
-      language: 'en-US'
-    }, `Thank you for calling ${business.fields['Name']}. I'm Maya, your AI assistant. How can I help you today?`);
-    
-    // If caller doesn't say anything, ask again
-    twiml.say({
-      voice: 'alice',
-      language: 'en-US'
-    }, 'I didn\'t hear anything. Please tell me how I can help you.');
-    
-    // Log the call
-    await airtableService.createCallLog({
-      business_id: business.id,
-      caller_number: req.body.From,
-      call_sid: req.body.CallSid,
-      status: 'Started'
+    // Initialize conversation in memory
+    activeConversations.set(req.body.CallSid, {
+      businessId: business.id,
+      businessName: business.fields['Name'],
+      callerNumber: req.body.From,
+      startTime: new Date(),
+      transcript: [],
+      orderDetails: null,
+      appointmentDetails: null
     });
     
-    // Send response back to Twilio
+    const gather = twiml.gather({
+      input: 'speech dtmf',
+      numDigits: 1,
+      timeout: 10,
+      speechTimeout: 'auto',
+      language: 'en-UK',
+      hints: 'menu, hours, order, biryani, chicken, yes, no, hello',
+      speechModel: 'phone_call',
+      enhanced: true,
+      profanityFilter: false,
+      action: `/webhook/conversation?business_id=${business.id}`,
+      method: 'POST',
+      actionOnEmptyResult: true
+    });
+    
+    gather.say({
+      voice: 'alice',
+      language: 'en-UK'
+    }, `Thank you for calling ${business.fields['Name']}. I'm Jennifer, your AI assistant. How can I help you today?`);
+    
+    twiml.say({
+      voice: 'alice',
+      language: 'en-UK'
+    }, 'I didn\'t hear anything. Please tell me how I can help you or press a number.');
+    
     res.type('text/xml').send(twiml.toString());
     
   } catch (error) {
     console.error('Error handling incoming call:', error);
     
-    // Error response
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.say({
-      voice: 'alice',
+      voice: 'Polly.Joanna',
       language: 'en-US'
     }, 'I\'m sorry, I\'m having technical difficulties. Please try calling back in a few moments.');
     
@@ -74,119 +79,241 @@ exports.handleIncomingCall = async (req, res) => {
 
 // This handles the conversation after the caller speaks
 exports.handleConversation = async (req, res) => {
-  console.log('💬 Conversation input:', req.body.SpeechResult);
+  console.log('\n========== CONVERSATION ==========');
+  console.log('Speech:', req.body.SpeechResult);
+  console.log('Digits:', req.body.Digits);
+  console.log('=================================\n');
   
   try {
     const businessId = req.query.business_id;
-    const userInput = req.body.SpeechResult;
     const callSid = req.body.CallSid;
+    let userInput = req.body.SpeechResult || '';
     
-    // Get business details
+    // Get conversation from memory
+    const conversation = activeConversations.get(callSid);
+    if (!conversation) {
+      throw new Error('Conversation not found in memory');
+    }
+    
+    // Handle DTMF input
+    if (req.body.Digits) {
+      const digit = req.body.Digits;
+      if (digit === '1') userInput = 'What is your menu?';
+      else if (digit === '2') userInput = 'What are your hours?';
+      else userInput = `User pressed ${digit}`;
+    }
+    
+    // Check for empty input
+    if (!userInput || userInput.trim() === '') {
+      const twiml = new twilio.twiml.VoiceResponse();
+      twiml.say({
+        voice: 'Polly.Joanna',
+        language: 'en-US'
+      }, 'I didn\'t catch that. Could you please repeat that?');
+      
+      const gather = twiml.gather({
+        input: 'speech dtmf',
+        numDigits: 1,
+        timeout: 10,
+        speechTimeout: 'auto',
+        language: 'en-UK',
+        hints: 'yes, no, menu, hours, order',
+        speechModel: 'phone_call',
+        enhanced: true,
+        action: `/webhook/conversation?business_id=${businessId}`,
+        method: 'POST',
+        actionOnEmptyResult: true
+      });
+      
+      return res.type('text/xml').send(twiml.toString());
+    }
+    
+    // Add to transcript
+    conversation.transcript.push(`Customer: ${userInput}`);
+    
+    // Get business details (from cache if possible)
     const business = await airtableService.getBusinessById(businessId);
     
-    // Get conversation history (if any)
-    const conversationHistory = await airtableService.getCallHistory(callSid);
+    // Build conversation history from memory
+    const conversationHistory = conversation.transcript.join('\n');
     
     // Generate AI response
     const aiResponse = await aiService.generateResponse(
       business,
       conversationHistory,
-      userInput
+      userInput,
+      callSid  // Pass callSid for state tracking
     );
     
-    // Update call log with conversation
-    await airtableService.updateCallLog(callSid, {
-      transcript: conversationHistory + '\nCustomer: ' + userInput + '\nAI: ' + aiResponse.message,
-      intent: aiResponse.intent
-    });
+    // Add AI response to transcript
+    conversation.transcript.push(`AI: ${aiResponse.message}`);
+    
+    // Extract order/appointment details if present
+    if (aiResponse.action) {
+      if (aiResponse.action.type === 'order') {
+        conversation.orderDetails = aiResponse.action.data;
+      } else if (aiResponse.action.type === 'booking') {
+        conversation.appointmentDetails = aiResponse.action.data;
+      }
+    }
     
     // Create TwiML response
     const twiml = new twilio.twiml.VoiceResponse();
     
-    // Process any actions (bookings, orders, etc.)
-    if (aiResponse.action) {
-      await processAction(aiResponse.action, business, req.body);
-    }
+    // Check for confirmation or completion
+    const isConfirmation = userInput.toLowerCase().includes('yes') || 
+                          userInput.toLowerCase().includes('confirm') ||
+                          userInput.toLowerCase().includes('correct') ||
+                          userInput.toLowerCase().includes('that\'s right');
     
-    // Say the AI response
+    const hasOrderInConversation = conversation.transcript.some(line => 
+      line.toLowerCase().includes('biryani') || 
+      line.toLowerCase().includes('order') ||
+      line.toLowerCase().includes('samosa')
+    );
+    
+    const isOrderComplete = (conversation.orderDetails && isConfirmation) || 
+                           (aiResponse.intent === 'order' && isConfirmation);
+    const isBookingComplete = conversation.appointmentDetails && isConfirmation;
+    
+    // Force end if conversation is too long
+    const conversationTurns = Math.floor(conversation.transcript.length / 2);
+    const shouldForceEnd = conversationTurns >= 5;
+    
+    // Say the AI response with natural voice and SSML enhancements
+    const enhancedMessage = addNaturalSSML(aiResponse.message);
     twiml.say({
-      voice: 'alice',
+      voice: 'Polly.Joanna',
       language: 'en-US'
-    }, aiResponse.message);
+    }, enhancedMessage);
     
     // Continue conversation or end call
-    if (aiResponse.continueConversation) {
+    if (aiResponse.continueConversation && !isOrderComplete && !isBookingComplete && !shouldForceEnd) {
       const gather = twiml.gather({
-  input: 'speech',
-  timeout: 10,  // Increase timeout
-  speechTimeout: 3,  // Give people time to think
-  action: `/webhook/conversation?business_id=${businessId}`,
-  method: 'POST',
-  actionOnEmptyResult: true
-    });
-      
-      gather.say({
-        voice: 'alice',
-        language: 'en-US'
-      }, 'Is there anything else I can help you with?');
+        input: 'speech dtmf',
+        numDigits: 1,
+        timeout: 10,
+        speechTimeout: 'auto',
+        language: 'en-UK',
+        hints: 'yes, no, done, finished, bye, order, menu, confirm',
+        speechModel: 'phone_call',
+        enhanced: true,
+        profanityFilter: false,
+        action: `/webhook/conversation?business_id=${businessId}`,
+        method: 'POST',
+        actionOnEmptyResult: true
+      });
     } else {
-      twiml.say({
-        voice: 'alice',
-        language: 'en-US'
-      }, `Thank you for calling ${business.fields['Name']}. Have a great day!`);
+      // Log why conversation ended
+      console.log(`📍 Ending conversation - Order complete: ${isOrderComplete}, Booking complete: ${isBookingComplete}, Force end: ${shouldForceEnd}, AI decision: ${!aiResponse.continueConversation}`);
+      
+      // End of conversation - now save everything to Airtable
+      await saveConversationToAirtable(callSid, conversation, business);
+      
+      // Final goodbye message
+      if (!aiResponse.message.toLowerCase().includes('thank you for calling')) {
+        twiml.say({
+          voice: 'Polly.Joanna',
+          language: 'en-US'
+        }, `Thank you for calling ${business.fields['Name']}. Have a wonderful day!`);
+      }
+      
+      // Clean up memory
+      activeConversations.delete(callSid);
     }
     
     res.type('text/xml').send(twiml.toString());
     
   } catch (error) {
-    console.error('Error in conversation:', error);
+    console.error('❌ Error in conversation:', error);
     
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.say({
-      voice: 'alice',
+      voice: 'Polly.Joanna',
       language: 'en-US'
-    }, 'I apologize, but I\'m having trouble understanding. Let me transfer you to someone who can help.');
+    }, 'I apologize, but I\'m having trouble understanding. Let me try to help you.');
     
     res.type('text/xml').send(twiml.toString());
   }
 };
 
-// Process actions like bookings or orders
-async function processAction(action, business, callData) {
-  console.log('🎯 Processing action:', action.type);
+// Add SSML to make speech more natural
+function addNaturalSSML(text) {
+  // Add pauses and emphasis for more natural speech
+  let enhanced = text;
   
-  switch (action.type) {
-    case 'booking':
-      // Create appointment in Airtable
-      await airtableService.createAppointment({
-        business_id: business.id,
-        customer_name: action.data.customer_name,
-        customer_phone: callData.From,
-        service: action.data.service,
-        date_time: action.data.date_time,
-        status: 'Confirmed'
-      });
-      
-      // TODO: Send SMS confirmation
-      break;
-      
-    case 'order':
-      // Create order in Airtable
+  // Add slight pauses after punctuation
+  enhanced = enhanced.replace(/\./g, '.<break time="300ms"/>');
+  enhanced = enhanced.replace(/,/g, ',<break time="200ms"/>');
+  enhanced = enhanced.replace(/\?/g, '?<break time="300ms"/>');
+  
+  // Add emphasis to certain words
+  enhanced = enhanced.replace(/\btotal\b/gi, '<emphasis level="moderate">total</emphasis>');
+  enhanced = enhanced.replace(/\bconfirm\b/gi, '<emphasis level="moderate">confirm</emphasis>');
+  enhanced = enhanced.replace(/\bthank you\b/gi, '<prosody rate="95%">thank you</prosody>');
+  
+  // Wrap in speak tags for SSML
+  return `<speak>${enhanced}</speak>`;
+}
+
+// Save everything to Airtable at the end
+async function saveConversationToAirtable(callSid, conversation, business) {
+  console.log('💾 Saving conversation to Airtable...');
+  
+  try {
+    // Calculate call duration
+    const duration = Math.round((new Date() - conversation.startTime) / 1000);
+    
+    // Determine intent from conversation
+    let intent = 'general';
+    if (conversation.orderDetails) intent = 'order';
+    else if (conversation.appointmentDetails) intent = 'booking';
+    
+    // Create call log with full transcript
+    await airtableService.createCallLog({
+      business_id: business.id,
+      caller_number: conversation.callerNumber,
+      call_sid: callSid,
+      status: 'Completed',
+      transcript: conversation.transcript.join('\n'),
+      intent: intent,
+      duration: duration
+    });
+    
+    // Create order if applicable
+    if (conversation.orderDetails) {
       await airtableService.createOrder({
         business_id: business.id,
-        customer_name: action.data.customer_name,
-        customer_phone: callData.From,
-        items: action.data.items,
-        total: action.data.total,
-        pickup_time: action.data.pickup_time,
-        status: 'Received'
+        ...conversation.orderDetails,
+        customer_phone: conversation.callerNumber
       });
-      
-      // TODO: Send SMS confirmation
-      break;
-      
-    case 'info':
-      // Just providing information, no action needed
-      break;
+    }
+    
+    // Create appointment if applicable  
+    if (conversation.appointmentDetails) {
+      await airtableService.createAppointment({
+        business_id: business.id,
+        ...conversation.appointmentDetails,
+        customer_phone: conversation.callerNumber
+      });
+    }
+    
+    console.log('✅ Conversation saved successfully');
+    
+  } catch (error) {
+    console.error('❌ Error saving to Airtable:', error);
+    // Don't throw - we don't want to break the call flow
   }
 }
+
+// Cleanup old conversations periodically (every hour)
+setInterval(() => {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  
+  for (const [callSid, conversation] of activeConversations.entries()) {
+    if (conversation.startTime < oneHourAgo) {
+      console.log(`🧹 Cleaning up old conversation: ${callSid}`);
+      activeConversations.delete(callSid);
+    }
+  }
+}, 60 * 60 * 1000);
